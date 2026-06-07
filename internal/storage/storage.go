@@ -14,14 +14,16 @@ type Store struct {
 	mu           sync.RWMutex
 }
 
+const TotalNodes = 14
+
 func NewStore(baseDir string) (*Store, error) {
 	absBase, err := filepath.Abs(baseDir)
 	if err != nil {
 		absBase = baseDir
 	}
 
-	nodePaths := make([]string, 9)
-	for i := 0; i < 9; i++ {
+	nodePaths := make([]string, TotalNodes)
+	for i := 0; i < TotalNodes; i++ {
 		nodePath := filepath.Join(absBase, fmt.Sprintf("node_%d", i))
 		if err := os.MkdirAll(nodePath, 0755); err != nil {
 			return nil, fmt.Errorf("create node dir %s: %w", nodePath, err)

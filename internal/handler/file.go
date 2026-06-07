@@ -79,12 +79,23 @@ func (h *FileHandler) Get(c *gin.Context) {
 func (h *FileHandler) Download(c *gin.Context) {
 	fileID := c.Param("id")
 
-	fileName, reader, size, err := h.svc.GetFileReader(fileID)
+	fileName, reader, size, rebuildResult, err := h.svc.GetFileReader(fileID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "download failed: " + err.Error()})
+		response := gin.H{"error": "download failed: " + err.Error()}
+		if rebuildResult != nil {
+			response["rebuild_result"] = rebuildResult
+		}
+		c.JSON(http.StatusInternalServerError, response)
 		return
 	}
 	defer reader.Close()
+
+	if rebuildResult != nil {
+		c.Header("X-Lazy-Rebuild", "true")
+		c.Header("X-Rebuild-Duration-Ms", strconv.FormatInt(rebuildResult.DurationMs, 10))
+		c.Header("X-Rebuild-Shards", strconv.Itoa(len(rebuildResult.RebuiltShards)))
+		c.Header("X-Hash-Verified", strconv.FormatBool(rebuildResult.HashVerified))
+	}
 
 	c.Header("Content-Disposition", "attachment; filename="+fileName)
 	c.Header("Content-Type", "application/octet-stream")

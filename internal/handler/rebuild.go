@@ -30,21 +30,29 @@ func (h *RebuildHandler) Rebuild(c *gin.Context) {
 		return
 	}
 
-	if len(req.FailedNodeIDs) > erasure.ParityShards {
+	fileMeta, err := db.GetFile(req.FileID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found: " + err.Error()})
+		return
+	}
+
+	config, err := erasure.GetConfig(fileMeta.DataShards, fileMeta.ParityShards)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "get codec config: " + err.Error()})
+		return
+	}
+
+	if len(req.FailedNodeIDs) > config.ParityShards {
 		c.JSON(http.StatusConflict, gin.H{
 			"code":    409,
 			"message": "too many failed nodes",
 			"data": gin.H{
-				"failed_nodes":   len(req.FailedNodeIDs),
-				"max_recoverable": erasure.ParityShards,
-				"error":         fmt.Sprintf("cannot recover from %d node failures, maximum recoverable is %d", len(req.FailedNodeIDs), erasure.ParityShards),
+				"failed_nodes":    len(req.FailedNodeIDs),
+				"max_recoverable": config.ParityShards,
+				"codec_name":      config.Name,
+				"error":           fmt.Sprintf("cannot recover from %d node failures, maximum recoverable is %d for %s", len(req.FailedNodeIDs), config.ParityShards, config.Name),
 			},
 		})
-		return
-	}
-
-	if _, err := db.GetFile(req.FileID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "file not found: " + err.Error()})
 		return
 	}
 
@@ -62,7 +70,7 @@ func (h *RebuildHandler) Rebuild(c *gin.Context) {
 }
 
 type RebuildNodeRequest struct {
-	NodeID int `json:"node_id" binding:"required,min=0,max=8"`
+	NodeID int `json:"node_id" binding:"required,min=0,max=13"`
 }
 
 func (h *RebuildHandler) RebuildByNode(c *gin.Context) {

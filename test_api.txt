@@ -1,10 +1,28 @@
-# Reed-Solomon(6,3) 纠删码服务 API 测试说明
+# Reed-Solomon 纠删码服务 API 测试说明
 
 ## 启动服务
 ```bash
 ./rs-service.exe
 ```
 服务启动在 http://localhost:8080
+
+## RS码率自动选择
+- **小文件 (< 1MB)**: RS(4,2) - 4数据块 + 2校验块，最大容错2节点
+- **中等文件 (1MB ~ 10MB)**: RS(6,3) - 6数据块 + 3校验块，最大容错3节点
+- **大文件 (>= 10MB)**: RS(10,4) - 10数据块 + 4校验块，最大容错4节点
+
+## Prometheus Metrics
+访问 http://localhost:8080/metrics 获取监控指标:
+- rs_service_rebuild_total - 总重建次数
+- rs_service_rebuild_success_total - 成功重建次数
+- rs_service_rebuild_failed_total - 失败重建次数
+- rs_service_rebuild_duration_seconds - 重建耗时直方图
+- rs_service_rebuild_avg_duration_seconds - 平均重建耗时
+- rs_service_lazy_rebuild_total - 懒加载重建次数
+- rs_service_active_rebuilds - 当前正在进行的重建数
+- rs_service_node_status - 节点状态 (1=online, 0=offline)
+- rs_service_files_total - 文件总数
+- rs_service_total_data_size_bytes - 总数据量
 
 ## API 列表
 
@@ -31,11 +49,18 @@ GET /api/v1/files/:id
 curl http://localhost:8080/api/v1/files/{file_id}
 ```
 
-### 4. 下载文件
+### 4. 下载文件 (支持懒加载重建)
 GET /api/v1/files/:id/download
 
+注意: 如果检测到分片丢失，会自动触发懒加载重建，重建完成后返回文件。
+响应头包含重建信息:
+- X-Lazy-Rebuild: true (如果触发了重建)
+- X-Rebuild-Duration-Ms: 重建耗时(ms)
+- X-Rebuild-Shards: 重建的分片数量
+- X-Hash-Verified: 哈希校验结果
+
 ```bash
-curl -O http://localhost:8080/api/v1/files/{file_id}/download
+curl -v -O http://localhost:8080/api/v1/files/{file_id}/download
 ```
 
 ### 5. 获取文件分片信息

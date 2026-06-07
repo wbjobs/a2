@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 	"rs-service/internal/db"
+	"rs-service/internal/metrics"
 	"rs-service/internal/service"
 	"strconv"
 
@@ -93,6 +94,10 @@ func (h *NodeHandler) SetStatus(c *gin.Context) {
 		return
 	}
 
+	node, _ := db.GetNode(nodeID)
+	online := status == db.NodeStatusOnline
+	metrics.Get().UpdateNodeStatus(nodeID, node.Name, online)
+
 	fileIDs, err := h.svc.GetFilesAffectedByNode(nodeID)
 	if err != nil {
 		fileIDs = []string{}
@@ -127,6 +132,9 @@ func (h *NodeHandler) MarkOffline(c *gin.Context) {
 		return
 	}
 
+	node, _ := db.GetNode(nodeID)
+	metrics.Get().UpdateNodeStatus(nodeID, node.Name, false)
+
 	fileIDs, err := h.svc.GetFilesAffectedByNode(nodeID)
 	if err != nil {
 		fileIDs = []string{}
@@ -160,6 +168,9 @@ func (h *NodeHandler) MarkOnline(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "mark node online failed: " + err.Error()})
 		return
 	}
+
+	node, _ := db.GetNode(nodeID)
+	metrics.Get().UpdateNodeStatus(nodeID, node.Name, true)
 
 	c.JSON(http.StatusOK, gin.H{
 		"code":    0,

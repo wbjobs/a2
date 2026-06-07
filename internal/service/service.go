@@ -6,23 +6,24 @@ import (
 	"io"
 	"rs-service/internal/db"
 	"rs-service/internal/erasure"
+	"rs-service/internal/metrics"
 	"rs-service/internal/model"
 	"rs-service/internal/storage"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 type Service struct {
-	enc   *erasure.Encoder
 	store *storage.Store
+	mu    sync.Mutex
 }
 
-func NewService(enc *erasure.Encoder, store *storage.Store) *Service {
+func NewService(store *storage.Store) *Service {
 	return &Service{
-		enc:   enc,
 		store: store,
 	}
 }
@@ -35,6 +36,8 @@ type UploadResult struct {
 	ShardSize    int64  `json:"shard_size"`
 	DataShards   int    `json:"data_shards"`
 	ParityShards int    `json:"parity_shards"`
+	TotalShards  int    `json:"total_shards"`
+	CodecName    string `json:"codec_name"`
 }
 
 func (s *Service) UploadFile(fileName string, r io.Reader, fileSize int64) (*UploadResult, error) {
@@ -48,7 +51,14 @@ func (s *Service) UploadFile(fileName string, r io.Reader, fileSize int64) (*Upl
 
 	originalHash := erasure.HashData(data)
 
-	shards, shardSize, err := s.enc.Encode(data)
+	config := erasure.SelectConfig(fileSize)
+
+	enc, err := erasure.GetEncoder(config.DataShards, config.ParityShards)
+	if err != nil {
+		return nil, fmt.Errorf("get encoder: %w", err)
+	}
+
+	shards, shardSize, err := enc.Encode(data)
 	if err != nil {
 		return nil, fmt.Errorf("encode file: %w", err)
 	}
@@ -57,11 +67,11 @@ func (s *Service) UploadFile(fileName string, r io.Reader, fileSize int64) (*Upl
 	if err != nil {
 		return nil, fmt.Errorf("get online nodes: %w", err)
 	}
-	if len(onlineNodes) < erasure.TotalShards {
-		return nil, fmt.Errorf("not enough online nodes: need %d, have %d", erasure.TotalShards, len(onlineNodes))
+	if len(onlineNodes) < config.TotalShards {
+		return nil, fmt.Errorf("not enough online nodes: need %d, have %d", config.TotalShards, len(onlineNodes))
 	}
 
-	nodeIDs := onlineNodes[:erasure.TotalShards]
+	nodeIDs := onlineNodes[:config.TotalShards]
 	fileID := uuid.New().String()
 
 	hashes, sizes, err := s.store.SaveShards(fileID, shards, nodeIDs)
@@ -75,13 +85,13 @@ func (s *Service) UploadFile(fileName string, r io.Reader, fileSize int64) (*Upl
 		Size:         fileSize,
 		OriginalHash: originalHash,
 		ShardSize:    shardSize,
-		DataShards:   erasure.DataShards,
-		ParityShards: erasure.ParityShards,
-		TotalShards:  erasure.TotalShards,
+		DataShards:   config.DataShards,
+		ParityShards: config.ParityShards,
+		TotalShards:  config.TotalShards,
 		CreatedAt:    time.Now(),
 	}
 	if err := db.InsertFile(fileMeta); err != nil {
-		_ = s.store.DeleteFileShards(fileID, nodeIDs, erasure.TotalShards)
+		_ = s.store.DeleteFileShards(fileID, nodeIDs, config.TotalShards)
 		return nil, fmt.Errorf("save file meta: %w", err)
 	}
 
@@ -92,14 +102,16 @@ func (s *Service) UploadFile(fileName string, r io.Reader, fileSize int64) (*Upl
 			NodeID:     nodeIDs[i],
 			Size:       sizes[i],
 			Hash:       hashes[i],
-			IsParity:   i >= erasure.DataShards,
+			IsParity:   i >= config.DataShards,
 			StoredAt:   time.Now(),
 		}
 		if err := db.InsertShard(shard); err != nil {
-			_ = s.store.DeleteFileShards(fileID, nodeIDs, erasure.TotalShards)
+			_ = s.store.DeleteFileShards(fileID, nodeIDs, config.TotalShards)
 			return nil, fmt.Errorf("save shard meta: %w", err)
 		}
 	}
+
+	go metrics.Get().RefreshFileStats()
 
 	return &UploadResult{
 		FileID:       fileID,
@@ -107,42 +119,48 @@ func (s *Service) UploadFile(fileName string, r io.Reader, fileSize int64) (*Upl
 		FileSize:     fileSize,
 		OriginalHash: originalHash,
 		ShardSize:    shardSize,
-		DataShards:   erasure.DataShards,
-		ParityShards: erasure.ParityShards,
+		DataShards:   config.DataShards,
+		ParityShards: config.ParityShards,
+		TotalShards:  config.TotalShards,
+		CodecName:    config.Name,
 	}, nil
 }
 
 type RebuildResult struct {
-	FileID          string   `json:"file_id"`
-	FileName        string   `json:"file_name"`
-	FailedNodeIDs   []int    `json:"failed_node_ids"`
+	FileID          string    `json:"file_id"`
+	FileName        string    `json:"file_name"`
+	FailedNodeIDs   []int     `json:"failed_node_ids"`
 	StartTime       time.Time `json:"start_time"`
 	EndTime         time.Time `json:"end_time"`
-	DurationMs      int64    `json:"duration_ms"`
-	DataSize        int64    `json:"data_size"`
-	HashVerified    bool     `json:"hash_verified"`
-	OriginalHash    string   `json:"original_hash"`
-	RebuiltHash     string   `json:"rebuilt_hash,omitempty"`
-	RebuiltShards   []int    `json:"rebuilt_shards"`
-	Status          string   `json:"status"`
-	ErrorMessage    string   `json:"error_message,omitempty"`
+	DurationMs      int64     `json:"duration_ms"`
+	DataSize        int64     `json:"data_size"`
+	HashVerified    bool      `json:"hash_verified"`
+	OriginalHash    string    `json:"original_hash"`
+	RebuiltHash     string    `json:"rebuilt_hash,omitempty"`
+	RebuiltShards   []int     `json:"rebuilt_shards"`
+	Status          string    `json:"status"`
+	ErrorMessage    string    `json:"error_message,omitempty"`
+	CodecName       string    `json:"codec_name,omitempty"`
+	IsLazyRebuild   bool      `json:"is_lazy_rebuild,omitempty"`
 }
 
 func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResult, error) {
+	return s.rebuildFileInternal(fileID, failedNodeIDs, false)
+}
+
+func (s *Service) RebuildFileLazy(fileID string, failedNodeIDs []int) (*RebuildResult, error) {
+	return s.rebuildFileInternal(fileID, failedNodeIDs, true)
+}
+
+func (s *Service) rebuildFileInternal(fileID string, failedNodeIDs []int, isLazy bool) (*RebuildResult, error) {
 	startTime := time.Now()
+	metrics.Get().RecordRebuildStart()
+
 	result := &RebuildResult{
 		FileID:        fileID,
 		FailedNodeIDs: failedNodeIDs,
 		StartTime:     startTime,
-	}
-
-	if len(failedNodeIDs) > erasure.ParityShards {
-		result.Status = db.RebuildStatusFailed
-		result.ErrorMessage = fmt.Sprintf("too many failed nodes: %d, max recoverable: %d", len(failedNodeIDs), erasure.ParityShards)
-		result.EndTime = time.Now()
-		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
-		s.saveRebuildLog(result)
-		return result, fmt.Errorf(result.ErrorMessage)
+		IsLazyRebuild: isLazy,
 	}
 
 	fileMeta, err := db.GetFile(fileID)
@@ -152,12 +170,48 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		result.EndTime = time.Now()
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
+	}
+
+	config, err := erasure.GetConfig(fileMeta.DataShards, fileMeta.ParityShards)
+	if err != nil {
+		result.Status = db.RebuildStatusFailed
+		result.ErrorMessage = fmt.Sprintf("get codec config: %v", err)
+		result.EndTime = time.Now()
+		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
+		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
+		return result, nil
+	}
+
+	result.CodecName = config.Name
+
+	if len(failedNodeIDs) > config.ParityShards {
+		result.Status = db.RebuildStatusFailed
+		result.ErrorMessage = fmt.Sprintf("too many failed nodes: %d, max recoverable: %d for %s",
+			len(failedNodeIDs), config.ParityShards, config.Name)
+		result.EndTime = time.Now()
+		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
+		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
+		return result, fmt.Errorf(result.ErrorMessage)
 	}
 
 	result.FileName = fileMeta.Name
 	result.OriginalHash = fileMeta.OriginalHash
 	result.DataSize = fileMeta.Size
+
+	enc, err := erasure.GetEncoder(config.DataShards, config.ParityShards)
+	if err != nil {
+		result.Status = db.RebuildStatusFailed
+		result.ErrorMessage = fmt.Sprintf("get encoder: %v", err)
+		result.EndTime = time.Now()
+		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
+		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
+		return result, nil
+	}
 
 	shardsMeta, err := db.GetShardsByFile(fileID)
 	if err != nil {
@@ -166,6 +220,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		result.EndTime = time.Now()
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
@@ -174,8 +229,8 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		failedNodeMap[id] = true
 	}
 
-	shards := make([][]byte, erasure.TotalShards)
-	present := make([]bool, erasure.TotalShards)
+	shards := make([][]byte, config.TotalShards)
+	present := make([]bool, config.TotalShards)
 	var rebuiltShardIndices []int
 
 	for _, sm := range shardsMeta {
@@ -203,27 +258,30 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 			missingCount++
 		}
 	}
-	if missingCount > erasure.ParityShards {
+	if missingCount > config.ParityShards {
 		result.Status = db.RebuildStatusFailed
-		result.ErrorMessage = fmt.Sprintf("too many missing shards: %d, max recoverable: %d", missingCount, erasure.ParityShards)
+		result.ErrorMessage = fmt.Sprintf("too many missing shards: %d, max recoverable: %d for %s",
+			missingCount, config.ParityShards, config.Name)
 		result.EndTime = time.Now()
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		result.RebuiltShards = rebuiltShardIndices
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
-	if err := s.enc.Reconstruct(shards, present); err != nil {
+	if err := enc.Reconstruct(shards, present); err != nil {
 		result.Status = db.RebuildStatusFailed
 		result.ErrorMessage = fmt.Sprintf("reconstruct shards: %v", err)
 		result.EndTime = time.Now()
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		result.RebuiltShards = rebuiltShardIndices
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
-	ok, err := s.enc.Verify(shards)
+	ok, err := enc.Verify(shards)
 	if err != nil || !ok {
 		result.Status = db.RebuildStatusFailed
 		result.ErrorMessage = fmt.Sprintf("verify shards failed: ok=%v, err=%v", ok, err)
@@ -231,10 +289,11 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		result.RebuiltShards = rebuiltShardIndices
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
-	rebuiltData, err := s.enc.Join(shards, fileMeta.Size)
+	rebuiltData, err := enc.Join(shards, fileMeta.Size)
 	if err != nil {
 		result.Status = db.RebuildStatusFailed
 		result.ErrorMessage = fmt.Sprintf("join shards: %v", err)
@@ -242,6 +301,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		result.RebuiltShards = rebuiltShardIndices
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
@@ -257,6 +317,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		result.RebuiltShards = rebuiltShardIndices
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
@@ -268,6 +329,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 		result.RebuiltShards = rebuiltShardIndices
 		s.saveRebuildLog(result)
+		metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 		return result, nil
 	}
 
@@ -304,6 +366,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 			result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 			result.RebuiltShards = rebuiltShardIndices
 			s.saveRebuildLog(result)
+			metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 			return result, nil
 		}
 
@@ -315,6 +378,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 				result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 				result.RebuiltShards = rebuiltShardIndices
 				s.saveRebuildLog(result)
+				metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 				return result, nil
 			}
 			_ = s.store.DeleteShard(shardMeta.NodeID, fileID, idx)
@@ -327,6 +391,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 			result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 			result.RebuiltShards = rebuiltShardIndices
 			s.saveRebuildLog(result)
+			metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), false, isLazy)
 			return result, nil
 		}
 	}
@@ -336,6 +401,7 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 	result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
 	result.RebuiltShards = rebuiltShardIndices
 	s.saveRebuildLog(result)
+	metrics.Get().RecordRebuildComplete(result.EndTime.Sub(result.StartTime), true, isLazy)
 
 	return result, nil
 }
@@ -359,20 +425,32 @@ func (s *Service) saveRebuildLog(result *RebuildResult) {
 	_ = db.InsertRebuildLog(log)
 }
 
-func (s *Service) DownloadFile(fileID string) (string, []byte, error) {
+func (s *Service) DownloadFile(fileID string) (string, []byte, *RebuildResult, error) {
 	fileMeta, err := db.GetFile(fileID)
 	if err != nil {
-		return "", nil, fmt.Errorf("get file meta: %w", err)
+		return "", nil, nil, fmt.Errorf("get file meta: %w", err)
+	}
+
+	config, err := erasure.GetConfig(fileMeta.DataShards, fileMeta.ParityShards)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("get codec config: %w", err)
+	}
+
+	enc, err := erasure.GetEncoder(config.DataShards, config.ParityShards)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("get encoder: %w", err)
 	}
 
 	shardsMeta, err := db.GetShardsByFile(fileID)
 	if err != nil {
-		return "", nil, fmt.Errorf("get shards meta: %w", err)
+		return "", nil, nil, fmt.Errorf("get shards meta: %w", err)
 	}
 
-	shards := make([][]byte, erasure.TotalShards)
-	present := make([]bool, erasure.TotalShards)
+	shards := make([][]byte, config.TotalShards)
+	present := make([]bool, config.TotalShards)
 	missingCount := 0
+	var failedNodeIDs []int
+	failedNodeMap := make(map[int]bool)
 
 	for _, sm := range shardsMeta {
 		node, err := db.GetNode(sm.NodeID)
@@ -380,6 +458,10 @@ func (s *Service) DownloadFile(fileID string) (string, []byte, error) {
 			shards[sm.ShardIndex] = nil
 			present[sm.ShardIndex] = false
 			missingCount++
+			if !failedNodeMap[sm.NodeID] {
+				failedNodeIDs = append(failedNodeIDs, sm.NodeID)
+				failedNodeMap[sm.NodeID] = true
+			}
 			continue
 		}
 
@@ -388,36 +470,59 @@ func (s *Service) DownloadFile(fileID string) (string, []byte, error) {
 			shards[sm.ShardIndex] = nil
 			present[sm.ShardIndex] = false
 			missingCount++
+			if !failedNodeMap[sm.NodeID] {
+				failedNodeIDs = append(failedNodeIDs, sm.NodeID)
+				failedNodeMap[sm.NodeID] = true
+			}
 		} else {
 			shards[sm.ShardIndex] = data
 			present[sm.ShardIndex] = true
 		}
 	}
 
+	var rebuildResult *RebuildResult
 	if missingCount > 0 {
-		if missingCount > erasure.ParityShards {
-			return "", nil, fmt.Errorf("too many missing shards: %d, max recoverable: %d", missingCount, erasure.ParityShards)
+		if missingCount > config.ParityShards {
+			return "", nil, nil, fmt.Errorf("too many missing shards: %d, max recoverable: %d for %s",
+				missingCount, config.ParityShards, config.Name)
 		}
 
-		if err := s.enc.ReconstructData(shards, present); err != nil {
-			return "", nil, fmt.Errorf("reconstruct data: %w", err)
+		sort.Ints(failedNodeIDs)
+		rebuildResult, err = s.RebuildFileLazy(fileID, failedNodeIDs)
+		if err != nil {
+			return "", nil, rebuildResult, fmt.Errorf("lazy rebuild failed: %w", err)
+		}
+		if rebuildResult.Status != db.RebuildStatusSuccess {
+			return "", nil, rebuildResult, fmt.Errorf("lazy rebuild failed: %s", rebuildResult.ErrorMessage)
+		}
+
+		for _, sm := range shardsMeta {
+			if shards[sm.ShardIndex] == nil {
+				data, hash, err := s.store.ReadShard(sm.NodeID, fileID, sm.ShardIndex)
+				if err != nil || hash != sm.Hash {
+					shards[sm.ShardIndex] = nil
+				} else {
+					shards[sm.ShardIndex] = data
+					present[sm.ShardIndex] = true
+				}
+			}
 		}
 	}
 
-	data, err := s.enc.Join(shards, fileMeta.Size)
+	data, err := enc.Join(shards, fileMeta.Size)
 	if err != nil {
-		return "", nil, fmt.Errorf("join shards: %w", err)
+		return "", nil, rebuildResult, fmt.Errorf("join shards: %w", err)
 	}
 
-	return fileMeta.Name, data, nil
+	return fileMeta.Name, data, rebuildResult, nil
 }
 
-func (s *Service) GetFileReader(fileID string) (string, io.ReadCloser, int64, error) {
-	name, data, err := s.DownloadFile(fileID)
+func (s *Service) GetFileReader(fileID string) (string, io.ReadCloser, int64, *RebuildResult, error) {
+	name, data, rebuildResult, err := s.DownloadFile(fileID)
 	if err != nil {
-		return "", nil, 0, err
+		return "", nil, 0, rebuildResult, err
 	}
-	return name, io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	return name, io.NopCloser(bytes.NewReader(data)), int64(len(data)), rebuildResult, nil
 }
 
 func intsToString(ids []int) string {

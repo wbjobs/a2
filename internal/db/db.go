@@ -202,14 +202,14 @@ func initNodes() error {
 	}
 
 	now := time.Now()
-	for i := 0; i < 9; i++ {
+	for i := 0; i < 14; i++ {
 		nodePath := filepath.Join("nodes", fmt.Sprintf("node_%d", i))
 		absPath, err := filepath.Abs(nodePath)
 		if err != nil {
 			absPath = nodePath
 		}
 		_, err = execWithRetry(`
-			INSERT INTO nodes (id, name, path, status, created_at, updated_at)
+			INSERT OR IGNORE INTO nodes (id, name, path, status, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?)
 		`, i, fmt.Sprintf("node_%d", i), absPath, NodeStatusOnline, now, now)
 		if err != nil {
