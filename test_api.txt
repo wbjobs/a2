@@ -1,0 +1,197 @@
+# Reed-Solomon(6,3) 纠删码服务 API 测试说明
+
+## 启动服务
+```bash
+./rs-service.exe
+```
+服务启动在 http://localhost:8080
+
+## API 列表
+
+### 1. 上传文件
+POST /api/v1/files
+Content-Type: multipart/form-data
+参数: file (文件)
+
+```bash
+curl -X POST -F "file=@test.txt" http://localhost:8080/api/v1/files
+```
+
+### 2. 获取文件列表
+GET /api/v1/files
+
+```bash
+curl http://localhost:8080/api/v1/files
+```
+
+### 3. 获取文件详情
+GET /api/v1/files/:id
+
+```bash
+curl http://localhost:8080/api/v1/files/{file_id}
+```
+
+### 4. 下载文件
+GET /api/v1/files/:id/download
+
+```bash
+curl -O http://localhost:8080/api/v1/files/{file_id}/download
+```
+
+### 5. 获取文件分片信息
+GET /api/v1/files/:id/shards
+
+```bash
+curl http://localhost:8080/api/v1/files/{file_id}/shards
+```
+
+### 6. 获取节点列表
+GET /api/v1/nodes
+
+```bash
+curl http://localhost:8080/api/v1/nodes
+```
+
+### 7. 获取节点详情
+GET /api/v1/nodes/:id
+
+```bash
+curl http://localhost:8080/api/v1/nodes/0
+```
+
+### 8. 标记节点下线（故障模拟）
+POST /api/v1/nodes/:id/offline
+
+```bash
+curl -X POST http://localhost:8080/api/v1/nodes/0/offline
+```
+
+### 9. 标记节点上线
+POST /api/v1/nodes/:id/online
+
+```bash
+curl -X POST http://localhost:8080/api/v1/nodes/0/online
+```
+
+### 10. 设置节点状态
+PUT /api/v1/nodes/:id/status
+Content-Type: application/json
+{"status": "online|offline"}
+
+```bash
+curl -X PUT -H "Content-Type: application/json" -d '{"status":"offline"}' http://localhost:8080/api/v1/nodes/0/status
+```
+
+### 11. 重建文件（指定失败节点）
+POST /api/v1/rebuild
+Content-Type: application/json
+{"file_id": "...", "failed_node_ids": [0, 1]}
+
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"file_id":"{file_id}","failed_node_ids":[0]}' http://localhost:8080/api/v1/rebuild
+```
+
+### 12. 按节点重建（重建该节点上所有受影响的文件）
+POST /api/v1/rebuild/node
+Content-Type: application/json
+{"node_id": 0}
+
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"node_id":0}' http://localhost:8080/api/v1/rebuild/node
+```
+
+### 13. 获取重建日志
+GET /api/v1/rebuild/logs
+
+```bash
+curl http://localhost:8080/api/v1/rebuild/logs
+```
+
+### 14. 获取指定文件的重建日志
+GET /api/v1/rebuild/logs/:file_id
+
+```bash
+curl http://localhost:8080/api/v1/rebuild/logs/{file_id}
+```
+
+## 完整测试流程示例
+
+### 步骤1: 创建测试文件
+```bash
+echo "Hello, Reed-Solomon Erasure Coding Test!" > test.txt
+```
+
+### 步骤2: 上传文件
+```bash
+curl -X POST -F "file=@test.txt" http://localhost:8080/api/v1/files
+```
+保存返回的 file_id
+
+### 步骤3: 查看节点状态
+```bash
+curl http://localhost:8080/api/v1/nodes
+```
+
+### 步骤4: 模拟节点故障（标记node_0下线）
+```bash
+curl -X POST http://localhost:8080/api/v1/nodes/0/offline
+```
+
+### 步骤5: 触发数据重建
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"file_id":"{你的file_id}","failed_node_ids":[0]}' http://localhost:8080/api/v1/rebuild
+```
+
+### 步骤6: 查看重建日志
+```bash
+curl http://localhost:8080/api/v1/rebuild/logs
+```
+
+### 步骤7: 下载验证文件完整性
+```bash
+curl -O http://localhost:8080/api/v1/files/{你的file_id}/download
+diff test.txt {下载的文件名}
+```
+
+### 步骤8: 多节点故障测试（最多3个节点）
+```bash
+curl -X POST http://localhost:8080/api/v1/nodes/1/offline
+curl -X POST http://localhost:8080/api/v1/nodes/2/offline
+curl -X POST -H "Content-Type: application/json" -d '{"file_id":"{你的file_id}","failed_node_ids":[0,1,2]}' http://localhost:8080/api/v1/rebuild
+```
+
+## 项目结构
+```
+rs-service/
+├── main.go                    # 主入口
+├── go.mod
+├── internal/
+│   ├── db/
+│   │   └── db.go             # SQLite数据库层
+│   ├── model/
+│   │   └── model.go          # 数据模型定义
+│   ├── erasure/
+│   │   └── erasure.go        # Reed-Solomon编解码
+│   ├── storage/
+│   │   └── storage.go        # 节点存储管理
+│   ├── service/
+│   │   └── service.go        # 业务逻辑层
+│   └── handler/
+│       ├── file.go           # 文件API处理器
+│       ├── node.go           # 节点API处理器
+│       └── rebuild.go        # 重建API处理器
+├── nodes/                     # 9个虚拟节点存储目录
+│   ├── node_0/
+│   ├── node_1/
+│   └── ...
+└── data/
+    └── metadata.db           # SQLite元数据数据库
+```
+
+## 技术实现说明
+- **纠删码算法**: Reed-Solomon(6,3) - 6个数据块 + 3个校验块
+- **最大容错**: 最多3个节点故障
+- **哈希校验**: SHA-256
+- **数据存储**: 本地目录模拟9个节点
+- **元数据存储**: SQLite
+- **Web框架**: Gin
