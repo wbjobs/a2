@@ -136,6 +136,15 @@ func (s *Service) RebuildFile(fileID string, failedNodeIDs []int) (*RebuildResul
 		StartTime:     startTime,
 	}
 
+	if len(failedNodeIDs) > erasure.ParityShards {
+		result.Status = db.RebuildStatusFailed
+		result.ErrorMessage = fmt.Sprintf("too many failed nodes: %d, max recoverable: %d", len(failedNodeIDs), erasure.ParityShards)
+		result.EndTime = time.Now()
+		result.DurationMs = result.EndTime.Sub(result.StartTime).Milliseconds()
+		s.saveRebuildLog(result)
+		return result, fmt.Errorf(result.ErrorMessage)
+	}
+
 	fileMeta, err := db.GetFile(fileID)
 	if err != nil {
 		result.Status = db.RebuildStatusFailed

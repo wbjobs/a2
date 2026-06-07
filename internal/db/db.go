@@ -13,10 +13,14 @@ import (
 )
 
 const (
-	NodeStatusOnline  = "online"
-	NodeStatusOffline = "offline"
+	NodeStatusOnline    = "online"
+	NodeStatusOffline   = "offline"
 	RebuildStatusSuccess = "success"
 	RebuildStatusFailed  = "failed"
+
+	maxRetries      = 5
+	retryInterval   = 50 * time.Millisecond
+	busyTimeoutMs   = 5000
 )
 
 var db *sql.DB
@@ -28,12 +32,25 @@ func Init(dbPath string) error {
 		return fmt.Errorf("create db dir: %w", err)
 	}
 
-	db, err = sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(1)")
+	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)",
+		dbPath, busyTimeoutMs)
+
+	db, err = sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("open sqlite: %w", err)
 	}
 
 	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return fmt.Errorf("enable WAL mode: %w", err)
+	}
+
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMs)); err != nil {
+		return fmt.Errorf("set busy timeout: %w", err)
+	}
 
 	if err := createTables(); err != nil {
 		return fmt.Errorf("create tables: %w", err)
@@ -44,6 +61,74 @@ func Init(dbPath string) error {
 	}
 
 	return nil
+}
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "SQLITE_BUSY") ||
+		strings.Contains(errStr, "SQLITE_LOCKED")
+}
+
+func execWithRetry(query string, args ...interface{}) (sql.Result, error) {
+	var result sql.Result
+	var err error
+
+	for i := 0; i < maxRetries; i++ {
+		result, err = db.Exec(query, args...)
+		if err == nil {
+			return result, nil
+		}
+		if !isRetryableError(err) {
+			return nil, err
+		}
+		if i < maxRetries-1 {
+			time.Sleep(retryInterval * time.Duration(i+1))
+		}
+	}
+	return nil, fmt.Errorf("exec failed after %d retries: %w", maxRetries, err)
+}
+
+func queryWithRetry(query string, args ...interface{}) (*sql.Rows, error) {
+	var rows *sql.Rows
+	var err error
+
+	for i := 0; i < maxRetries; i++ {
+		rows, err = db.Query(query, args...)
+		if err == nil {
+			return rows, nil
+		}
+		if !isRetryableError(err) {
+			return nil, err
+		}
+		if i < maxRetries-1 {
+			time.Sleep(retryInterval * time.Duration(i+1))
+		}
+	}
+	return nil, fmt.Errorf("query failed after %d retries: %w", maxRetries, err)
+}
+
+func queryRowWithRetry(query string, args ...interface{}) *sql.Row {
+	var row *sql.Row
+	var err error
+
+	for i := 0; i < maxRetries; i++ {
+		row = db.QueryRow(query, args...)
+		err = row.Err()
+		if err == nil {
+			return row
+		}
+		if !isRetryableError(err) {
+			return row
+		}
+		if i < maxRetries-1 {
+			time.Sleep(retryInterval * time.Duration(i+1))
+		}
+	}
+	return row
 }
 
 func createTables() error {
@@ -102,13 +187,13 @@ func createTables() error {
 	CREATE INDEX IF NOT EXISTS idx_shards_node_id ON shards(node_id);
 	`
 
-	_, err := db.Exec(sqlStmt)
+	_, err := execWithRetry(sqlStmt)
 	return err
 }
 
 func initNodes() error {
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM nodes").Scan(&count)
+	err := queryRowWithRetry("SELECT COUNT(*) FROM nodes").Scan(&count)
 	if err != nil {
 		return err
 	}
@@ -123,7 +208,7 @@ func initNodes() error {
 		if err != nil {
 			absPath = nodePath
 		}
-		_, err = db.Exec(`
+		_, err = execWithRetry(`
 			INSERT INTO nodes (id, name, path, status, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?)
 		`, i, fmt.Sprintf("node_%d", i), absPath, NodeStatusOnline, now, now)
@@ -146,7 +231,7 @@ func GetDB() *sql.DB {
 }
 
 func InsertFile(f *model.File) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(`
 		INSERT INTO files (id, name, size, original_hash, shard_size, data_shards, parity_shards, total_shards, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, f.ID, f.Name, f.Size, f.OriginalHash, f.ShardSize, f.DataShards, f.ParityShards, f.TotalShards, f.CreatedAt)
@@ -155,7 +240,7 @@ func InsertFile(f *model.File) error {
 
 func GetFile(fileID string) (*model.File, error) {
 	var f model.File
-	err := db.QueryRow(`
+	err := queryRowWithRetry(`
 		SELECT id, name, size, original_hash, shard_size, data_shards, parity_shards, total_shards, created_at
 		FROM files WHERE id = ?
 	`, fileID).Scan(&f.ID, &f.Name, &f.Size, &f.OriginalHash, &f.ShardSize, &f.DataShards, &f.ParityShards, &f.TotalShards, &f.CreatedAt)
@@ -166,7 +251,7 @@ func GetFile(fileID string) (*model.File, error) {
 }
 
 func ListFiles() ([]*model.File, error) {
-	rows, err := db.Query(`
+	rows, err := queryWithRetry(`
 		SELECT id, name, size, original_hash, shard_size, data_shards, parity_shards, total_shards, created_at
 		FROM files ORDER BY created_at DESC
 	`)
@@ -188,7 +273,7 @@ func ListFiles() ([]*model.File, error) {
 }
 
 func InsertShard(s *model.Shard) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(`
 		INSERT INTO shards (file_id, shard_index, node_id, size, hash, is_parity, stored_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, s.FileID, s.ShardIndex, s.NodeID, s.Size, s.Hash, s.IsParity, s.StoredAt)
@@ -196,7 +281,7 @@ func InsertShard(s *model.Shard) error {
 }
 
 func GetShardsByFile(fileID string) ([]*model.Shard, error) {
-	rows, err := db.Query(`
+	rows, err := queryWithRetry(`
 		SELECT id, file_id, shard_index, node_id, size, hash, is_parity, stored_at
 		FROM shards WHERE file_id = ? ORDER BY shard_index
 	`, fileID)
@@ -220,7 +305,7 @@ func GetShardsByFile(fileID string) ([]*model.Shard, error) {
 }
 
 func GetNodes() ([]*model.Node, error) {
-	rows, err := db.Query(`
+	rows, err := queryWithRetry(`
 		SELECT id, name, path, status, created_at, updated_at
 		FROM nodes ORDER BY id
 	`)
@@ -243,7 +328,7 @@ func GetNodes() ([]*model.Node, error) {
 
 func GetNode(nodeID int) (*model.Node, error) {
 	var n model.Node
-	err := db.QueryRow(`
+	err := queryRowWithRetry(`
 		SELECT id, name, path, status, created_at, updated_at
 		FROM nodes WHERE id = ?
 	`, nodeID).Scan(&n.ID, &n.Name, &n.Path, &n.Status, &n.CreatedAt, &n.UpdatedAt)
@@ -254,14 +339,14 @@ func GetNode(nodeID int) (*model.Node, error) {
 }
 
 func SetNodeStatus(nodeID int, status string) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(`
 		UPDATE nodes SET status = ?, updated_at = ? WHERE id = ?
 	`, status, time.Now(), nodeID)
 	return err
 }
 
 func GetOnlineNodeIDs() ([]int, error) {
-	rows, err := db.Query("SELECT id FROM nodes WHERE status = ? ORDER BY id", NodeStatusOnline)
+	rows, err := queryWithRetry("SELECT id FROM nodes WHERE status = ? ORDER BY id", NodeStatusOnline)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +368,7 @@ func InsertRebuildLog(log *model.RebuildLog) error {
 	if log.HashVerified {
 		hashVerified = 1
 	}
-	_, err := db.Exec(`
+	_, err := execWithRetry(`
 		INSERT INTO rebuild_logs (file_id, failed_node_ids, start_time, end_time, duration_ms, 
 			data_size, hash_verified, rebuilt_shards, status, error_message)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -297,13 +382,13 @@ func ListRebuildLogs(fileID string) ([]*model.RebuildLog, error) {
 	var err error
 
 	if fileID != "" {
-		rows, err = db.Query(`
+		rows, err = queryWithRetry(`
 			SELECT id, file_id, failed_node_ids, start_time, end_time, duration_ms,
 				data_size, hash_verified, rebuilt_shards, status, COALESCE(error_message, '')
 			FROM rebuild_logs WHERE file_id = ? ORDER BY start_time DESC
 		`, fileID)
 	} else {
-		rows, err = db.Query(`
+		rows, err = queryWithRetry(`
 			SELECT id, file_id, failed_node_ids, start_time, end_time, duration_ms,
 				data_size, hash_verified, rebuilt_shards, status, COALESCE(error_message, '')
 			FROM rebuild_logs ORDER BY start_time DESC
@@ -330,21 +415,21 @@ func ListRebuildLogs(fileID string) ([]*model.RebuildLog, error) {
 }
 
 func UpdateShardNode(fileID string, shardIndex int, newNodeID int) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(`
 		UPDATE shards SET node_id = ? WHERE file_id = ? AND shard_index = ?
 	`, newNodeID, fileID, shardIndex)
 	return err
 }
 
 func UpdateShardHashAndSize(fileID string, shardIndex int, hash string, size int64) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(`
 		UPDATE shards SET hash = ?, size = ?, stored_at = ? WHERE file_id = ? AND shard_index = ?
 	`, hash, size, time.Now(), fileID, shardIndex)
 	return err
 }
 
 func GetFilesOnNode(nodeID int) ([]string, error) {
-	rows, err := db.Query(`
+	rows, err := queryWithRetry(`
 		SELECT DISTINCT file_id FROM shards WHERE node_id = ?
 	`, nodeID)
 	if err != nil {

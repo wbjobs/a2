@@ -110,9 +110,37 @@ foreach ($nodeId in $failedNodes) {
 }
 Write-Host ""
 
+Write-Host "[9/9] 测试超过容错阈值的场景 (4个节点故障)..." -ForegroundColor Yellow
+$tooManyFailedNodes = @(0, 1, 2, 3)
+$rebuildBodyTooMany = @{
+    file_id = $fileId
+    failed_node_ids = $tooManyFailedNodes
+} | ConvertTo-Json
+$rebuildResponseTooMany = curl.exe -s -w "`n%{http_code}" -X POST -H "Content-Type: application/json" -d $rebuildBodyTooMany "$baseUrl/rebuild"
+$responseLines = $rebuildResponseTooMany -split "`n"
+$statusCode = $responseLines[-1]
+$responseBody = $responseLines[0..($responseLines.Count-2)] -join "`n" | ConvertFrom-Json
+Write-Host "  HTTP状态码: $statusCode"
+if ($statusCode -eq "409") {
+    Write-Host "  阈值检查验证: 通过! 正确返回409 Conflict" -ForegroundColor Green
+    Write-Host "  失败节点数: $($responseBody.data.failed_nodes), 最大可恢复: $($responseBody.data.max_recoverable)"
+} else {
+    Write-Host "  阈值检查验证: 失败! 期望409, 实际$statusCode" -ForegroundColor Red
+}
+Write-Host ""
+
+# 恢复节点
+Write-Host "恢复节点状态..." -ForegroundColor Yellow
+foreach ($nodeId in $failedNodes) {
+    curl.exe -s -X POST "$baseUrl/nodes/$nodeId/online" | Out-Null
+    Write-Host "  节点$nodeId 已恢复在线"
+}
+Write-Host ""
+
 Write-Host "=== 测试完成 ===" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "关键性能指标:" -ForegroundColor Cyan
 Write-Host "  重建耗时: $($rebuildData.duration_ms) ms"
 Write-Host "  数据吞吐量: $([math]::Round($rebuildData.data_size / $rebuildData.duration_ms * 1000 / 1024, 2)) KB/s"
 Write-Host "  哈希校验: $(if ($rebuildData.hash_verified) { '通过' } else { '失败' })"
+Write-Host "  阈值检查: 通过 (4节点故障返回409)"

@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"rs-service/internal/db"
+	"rs-service/internal/erasure"
 	"rs-service/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -18,13 +20,26 @@ func NewRebuildHandler(svc *service.Service) *RebuildHandler {
 
 type RebuildRequest struct {
 	FileID        string `json:"file_id" binding:"required"`
-	FailedNodeIDs []int  `json:"failed_node_ids" binding:"required,min=1,max=3"`
+	FailedNodeIDs []int  `json:"failed_node_ids" binding:"required,min=1"`
 }
 
 func (h *RebuildHandler) Rebuild(c *gin.Context) {
 	var req RebuildRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+
+	if len(req.FailedNodeIDs) > erasure.ParityShards {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":    409,
+			"message": "too many failed nodes",
+			"data": gin.H{
+				"failed_nodes":   len(req.FailedNodeIDs),
+				"max_recoverable": erasure.ParityShards,
+				"error":         fmt.Sprintf("cannot recover from %d node failures, maximum recoverable is %d", len(req.FailedNodeIDs), erasure.ParityShards),
+			},
+		})
 		return
 	}
 
